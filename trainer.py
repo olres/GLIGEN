@@ -25,6 +25,10 @@ try:
     from apex import amp
 except:
     pass  
+
+import wandb
+import json
+
 # = = = = = = = = = = = = = = = = = = useful functions = = = = = = = = = = = = = = = = = #
 
 
@@ -37,13 +41,17 @@ class ImageCaptionSaver:
         self.scale_each = scale_each
         self.range = range
 
-    def __call__(self, images, real, masked_real, captions, seen):
+    def __call__(self, images, grounding_images, real, masked_real, captions, seen):
         
         save_path = os.path.join(self.base_path, str(seen).zfill(8)+'.png')
         torchvision.utils.save_image( images, save_path, nrow=self.nrow, normalize=self.normalize, scale_each=self.scale_each, range=self.range )
         
         save_path = os.path.join(self.base_path, str(seen).zfill(8)+'_real.png')
         torchvision.utils.save_image( real, save_path, nrow=self.nrow)
+
+        if grounding_images is not None:
+            save_path = os.path.join(self.base_path, str(seen).zfill(8)+'_source.png')
+            torchvision.utils.save_image( grounding_images, save_path, nrow=self.nrow)
 
         if masked_real is not None:
             # only inpaiting mode case 
@@ -115,7 +123,10 @@ def count_params(params):
     total_trainable_params_count = 0 
     for p in params:
         total_trainable_params_count += p.numel()
+    
+    print("")
     print("total_trainable_params_count is: ", total_trainable_params_count)
+    print("")
 
 
 def update_ema(target_params, source_params, rate=0.99):
@@ -165,6 +176,22 @@ def create_expt_folder_with_auto_resuming(OUTPUT_ROOT, name):
 
 class Trainer:
     def __init__(self, config):
+
+        def json_friendly_config(config):
+            # 过滤或转换 config 中无法序列化的项
+            friendly_config = {}
+            for key, value in config.items():
+                try:
+                    json.dumps({key: value})  # 尝试将项转换为 JSON
+                    friendly_config[key] = value
+                except (TypeError, ValueError):
+                    friendly_config[key] = str(value)  # 将无法序列化的项转换为字符串
+            return friendly_config
+
+        if config.if_wandb_log:
+            wandb.init(project=config.name, config=json_friendly_config(config))
+    
+        # ===================================================
 
         self.config = config
         self.device = torch.device("cuda")
@@ -241,10 +268,16 @@ class Trainer:
                 assert name in original_params_names, name 
             all_params_name.append(name) 
 
+        self.trainable_params_names = trainable_names
 
         self.opt = torch.optim.AdamW(params, lr=config.base_learning_rate, weight_decay=config.weight_decay) 
-        count_params(params)
         
+        print("")
+        print("count_params")
+        count_params(params)
+        print("")
+
+        self.accumulate_grad_batches = config.accumulate_grad_batches if hasattr(config, 'accumulate_grad_batches') else 1
         
 
 
@@ -283,8 +316,27 @@ class Trainer:
 
         if get_rank() == 0:
             total_image = dataset_train.total_images()
+            print("")
             print("Total training images: ", total_image)     
+            print("")
         
+
+        # JHY: NOTE: add attribute for save grounding images
+        self.grounding_type = dataset_train.grounding_type
+
+        # copy from dataset/ULIP_ShapeNet.py
+        if self.grounding_type == "canny":
+            self.source_name = "canny_edge"
+            self.target_name = "image"
+        elif self.grounding_type == "depth":
+            self.source_name = "depth"
+            self.target_name = "image"
+        elif self.grounding_type == "hed":
+            self.source_name = "hed_edge"
+            self.target_name = "image"
+        else:
+            self.source_name = "source"
+            self.target_name = "image"
 
 
 
@@ -365,6 +417,7 @@ class Trainer:
         model_output = self.model(input)
         
         loss = torch.nn.functional.mse_loss(model_output, noise) * self.l_simple_weight
+        loss = loss / self.accumulate_grad_batches
 
         self.loss_dict = {"loss": loss.item()}
 
@@ -376,26 +429,59 @@ class Trainer:
 
         iterator = tqdm(range(self.starting_iter, self.config.total_iters), desc='Training progress',  disable=get_rank() != 0 )
         self.model.train()
+
+        accumulate_step = 0
+
         for iter_idx in iterator: # note: iter_idx is not from 0 if resume training
             self.iter_idx = iter_idx
 
-            self.opt.zero_grad()
+            if accumulate_step % self.accumulate_grad_batches == 0:
+                self.opt.zero_grad()
+
             batch = next(self.loader_train)
             batch_to_device(batch, self.device)
 
             loss = self.run_one_step(batch)
             loss.backward()
-            self.opt.step() 
-            self.scheduler.step()
-            if self.config.enable_ema:
-                update_ema(self.ema_params, self.master_params, self.config.ema_rate)
 
+            accumulate_step += 1
+
+            if accumulate_step % self.accumulate_grad_batches == 0:
+                self.opt.step() 
+                self.scheduler.step()
+
+                if self.config.enable_ema:
+                    update_ema(self.ema_params, self.master_params, self.config.ema_rate)
+
+                # the range of the gradient
+                grad_norm = sum(param.grad.data.norm(2).item() ** 2 for name, param in self.model.named_parameters() if param.grad is not None and name in self.trainable_params_names) ** 0.5
+                wandb.log({"grad_norm": grad_norm}, step=iter_idx)
+
+                self.opt.zero_grad()
+                
 
             if (get_rank() == 0):
+                wandb.log(self.loss_dict, step=iter_idx)
+
                 if (iter_idx % 10 == 0):
                     self.log_loss() 
+
+                    # log learning rate
+                    lr_temp = self.scheduler.get_last_lr()[0]
+                    wandb.log({"learning_rate": lr_temp}, step=iter_idx)
+
+                    # log trainable parameters
+                    # for name, param in self.model.named_parameters():
+                    #     if param.requires_grad and name in self.trainable_params_names:
+                    #         wandb.log({f"{name}_mean": param.data.mean().item(), f"{name}_std": param.data.std().item()}, step=iter_idx)
+
+
                 if (iter_idx == 0)  or  ( iter_idx % self.config.save_every_iters == 0 )  or  (iter_idx == self.config.total_iters-1):
                     self.save_ckpt_and_result()
+
+                if not self.config.disable_inference_in_training and ( (iter_idx == 0) or (iter_idx % self.config.inference_in_training_every_iters == 0) ):
+                    self.log_result_in_training()
+
             synchronize()
 
         
@@ -404,70 +490,130 @@ class Trainer:
         exit()
 
 
+    def start_validating(self):
+
+        print("!!!!!!!!!!!!!Start Validating!!!!!!!!!!!!!!!!!!!!")
+
+        iterator = tqdm(range(self.starting_iter, self.config.total_iters), desc='Validating progress',  disable=get_rank() != 0 )
+        self.model.eval()
+
+
+        for iter_idx in iterator:
+            self.iter_idx = iter_idx
+
+            self.log_result_in_training()
+
+            synchronize()
+        
+        synchronize()
+        print("Validate finished. Start exiting")
+        exit()
+
+
     def log_loss(self):
         for k, v in self.loss_dict.items():
             self.writer.add_scalar(  k, v, self.iter_idx+1  )  # we add 1 as the actual name
     
 
+    '''
+    JHY: NOTE: do the inference during the training, log result
+    '''
+    @torch.no_grad()
+    def inference_in_training(self):
+        # if not self.config.disable_inference_in_training:
+
+        model_wo_wrapper = self.model.module if self.config.distributed else self.model
+            
+        # Do an inference on one training batch 
+        batch_here = self.config.batch_size
+        batch = sub_batch( next(self.loader_train), batch_here)
+        batch_to_device(batch, self.device)
+
+        # create box or key point for pose images for better visualization
+        if "boxes" in batch:
+            real_images_with_box_drawing = [] # we save this durining trianing for better visualization
+            for i in range(batch_here):
+                temp_data = {"image": batch["image"][i], "boxes":batch["boxes"][i]}
+                im = self.dataset_train.datasets[0].vis_getitem_data(out=temp_data, return_tensor=True, print_caption=False)
+                real_images_with_box_drawing.append(im)
+            real_images_with_box_drawing = torch.stack(real_images_with_box_drawing)
+        else:
+            # keypoint case 
+            # and else cases
+            real_images_with_box_drawing = batch["image"]*0.5 + 0.5 
+
+        # JHY: NOTE: store source images, only when using my custom dataset
+        if self.grounding_type is not None:
+            grounding_images = batch[self.source_name]*0.5 + 0.5 
+        else:
+            grounding_images = None
+            
+        # prepare text
+        uc = self.text_encoder.encode( batch_here*[""] )
+        context = self.text_encoder.encode(  batch["caption"]  )
+        
+        # prepare sampler
+        plms_sampler = PLMSSampler(self.diffusion, model_wo_wrapper)      
+        shape = (batch_here, model_wo_wrapper.in_channels, model_wo_wrapper.image_size, model_wo_wrapper.image_size)
+        
+        # extra input for inpainting 
+        inpainting_extra_input = None
+        if self.config.inpaint_mode:
+            z = self.autoencoder.encode( batch["image"] )
+            inpainting_mask = draw_masks_from_boxes(batch['boxes'], 64, randomize_fg_mask=self.config.randomize_fg_mask, random_add_bg_mask=self.config.random_add_bg_mask).cuda()
+            masked_z = z*inpainting_mask
+            inpainting_extra_input = torch.cat([masked_z,inpainting_mask], dim=1)
+        
+        # prepare grounding input
+        grounding_extra_input = None
+        if self.grounding_downsampler_input != None:
+            grounding_extra_input = self.grounding_downsampler_input.prepare(batch)
+        
+        grounding_input = self.grounding_tokenizer_input.prepare(batch)
+
+        # prepare input for the UNet model
+        input = dict( x=None, 
+                        timesteps=None, 
+                        context=context, 
+                        inpainting_extra_input=inpainting_extra_input,
+                        grounding_extra_input=grounding_extra_input,
+                        grounding_input=grounding_input )
+        
+        # sample result
+        samples = plms_sampler.sample(S=50, shape=shape, input=input, uc=uc, guidance_scale=5)
+        
+        # decode result into pixel space
+        autoencoder_wo_wrapper = self.autoencoder # Note itself is without wrapper since we do not train that. 
+        samples = autoencoder_wo_wrapper.decode(samples).cpu()
+        samples = torch.clamp(samples, min=-1, max=1)
+
+        # result for inpainting task
+        masked_real_image =  batch["image"]*torch.nn.functional.interpolate(inpainting_mask, size=(512, 512)) if self.config.inpaint_mode else None
+
+        # JHY: NOTE: sample result, grounding source, real target, masked real target for inpainting, caption
+        return samples, grounding_images, real_images_with_box_drawing, masked_real_image, batch["caption"]
+
+
+    '''
+    JHY: NOTE: log the inference result during training
+    '''
+    def log_result_in_training(self):
+        
+        iter_name = self.iter_idx + 1     # we add 1 as the actual name
+
+        samples, grounding_images, real_images_with_box_drawing, masked_real_image, captions = self.inference_in_training()
+            
+        self.image_caption_saver(images=samples, grounding_images=grounding_images, real=real_images_with_box_drawing,  masked_real=masked_real_image, captions=captions, seen=iter_name)
+
+
     @torch.no_grad()
     def save_ckpt_and_result(self):
 
-        model_wo_wrapper = self.model.module if self.config.distributed else self.model
+        # save checkpoint first
 
         iter_name = self.iter_idx + 1     # we add 1 as the actual name
 
-        if not self.config.disable_inference_in_training:
-            # Do an inference on one training batch 
-            batch_here = self.config.batch_size
-            batch = sub_batch( next(self.loader_train), batch_here)
-            batch_to_device(batch, self.device)
-
-            
-            if "boxes" in batch:
-                real_images_with_box_drawing = [] # we save this durining trianing for better visualization
-                for i in range(batch_here):
-                    temp_data = {"image": batch["image"][i], "boxes":batch["boxes"][i]}
-                    im = self.dataset_train.datasets[0].vis_getitem_data(out=temp_data, return_tensor=True, print_caption=False)
-                    real_images_with_box_drawing.append(im)
-                real_images_with_box_drawing = torch.stack(real_images_with_box_drawing)
-            else:
-                # keypoint case 
-                real_images_with_box_drawing = batch["image"]*0.5 + 0.5 
-                
-            
-            uc = self.text_encoder.encode( batch_here*[""] )
-            context = self.text_encoder.encode(  batch["caption"]  )
-            
-            plms_sampler = PLMSSampler(self.diffusion, model_wo_wrapper)      
-            shape = (batch_here, model_wo_wrapper.in_channels, model_wo_wrapper.image_size, model_wo_wrapper.image_size)
-            
-            # extra input for inpainting 
-            inpainting_extra_input = None
-            if self.config.inpaint_mode:
-                z = self.autoencoder.encode( batch["image"] )
-                inpainting_mask = draw_masks_from_boxes(batch['boxes'], 64, randomize_fg_mask=self.config.randomize_fg_mask, random_add_bg_mask=self.config.random_add_bg_mask).cuda()
-                masked_z = z*inpainting_mask
-                inpainting_extra_input = torch.cat([masked_z,inpainting_mask], dim=1)
-            
-            grounding_extra_input = None
-            if self.grounding_downsampler_input != None:
-                grounding_extra_input = self.grounding_downsampler_input.prepare(batch)
-            
-            grounding_input = self.grounding_tokenizer_input.prepare(batch)
-            input = dict( x=None, 
-                          timesteps=None, 
-                          context=context, 
-                          inpainting_extra_input=inpainting_extra_input,
-                          grounding_extra_input=grounding_extra_input,
-                          grounding_input=grounding_input )
-            samples = plms_sampler.sample(S=50, shape=shape, input=input, uc=uc, guidance_scale=5)
-            
-            autoencoder_wo_wrapper = self.autoencoder # Note itself is without wrapper since we do not train that. 
-            samples = autoencoder_wo_wrapper.decode(samples).cpu()
-            samples = torch.clamp(samples, min=-1, max=1)
-
-            masked_real_image =  batch["image"]*torch.nn.functional.interpolate(inpainting_mask, size=(512, 512)) if self.config.inpaint_mode else None
-            self.image_caption_saver(samples, real_images_with_box_drawing,  masked_real_image, batch["caption"], iter_name)
+        model_wo_wrapper = self.model.module if self.config.distributed else self.model
 
         ckpt = dict(model = model_wo_wrapper.state_dict(),
                     text_encoder = self.text_encoder.state_dict(),
@@ -482,5 +628,9 @@ class Trainer:
             ckpt["ema"] = self.ema.state_dict()
         torch.save( ckpt, os.path.join(self.name, "checkpoint_"+str(iter_name).zfill(8)+".pth") )
         torch.save( ckpt, os.path.join(self.name, "checkpoint_latest.pth") )
+
+        # log result
+        if not self.config.disable_inference_in_training:
+            self.log_result_in_training()
 
 

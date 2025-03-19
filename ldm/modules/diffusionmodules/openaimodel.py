@@ -233,7 +233,7 @@ class ResBlock(TimestepBlock):
 
 
 
-
+# JHY: NOTE: U Net model
 class UNetModel(nn.Module):
     def __init__(
         self,
@@ -394,6 +394,8 @@ class UNetModel(nn.Module):
             zero_module(conv_nd(dims, model_channels, out_channels, 3, padding=1)),
         )
 
+
+        # JHY: NOTE: position net is the *modality*_grounding_net.py that process grounding into tokens
         self.position_net = instantiate_from_config(grounding_tokenizer) 
         
 
@@ -430,17 +432,51 @@ class UNetModel(nn.Module):
 
 
         # Grounding tokens: B*N*C
+        # JHY: NOTE: from grounding to tokens
+        # {Batch * Num_Of_Token * Token_Channel_Dimension}
         objs = self.position_net( **grounding_input )  
         
         # Time embedding 
         t_emb = timestep_embedding(input["timesteps"], self.model_channels, repeat_only=False)
         emb = self.time_embed(t_emb)
 
+        # JHY: NOTE: dimension tested on HED grounding
         # input tensor  
         h = input["x"]
+
+        # print("")
+        # print("h shape: ")
+        # print(h.shape)
+        # print("")
+
+        '''
+        h shape: 
+        torch.Size([4, 4, 64, 64])
+        '''
+
+        # JHY: NOTE: first conv section
+        # JHY: NOTE: dimension is tested on HED grounding
+
+        # Attach the first conv to the original input
         if self.downsample_net != None and self.first_conv_type=="GLIGEN":
             temp  = self.downsample_net(input["grounding_extra_input"])
             h = th.cat( [h,temp], dim=1 )
+
+            # print("")
+            # print("first conv shape: ")
+            # print(temp.shape)
+            # print("h appended shape: ")
+            # print(h.shape)
+            # print("")
+
+            '''
+            first conv shape: 
+            torch.Size([4, 1, 64, 64])
+
+            h appended shape: 
+            torch.Size([4, 5, 64, 64])
+            '''
+            
         if self.inpaint_mode:
             if self.downsample_net != None:
                 breakpoint() # TODO: think about this case 
@@ -451,14 +487,22 @@ class UNetModel(nn.Module):
 
         # Start forwarding 
         hs = []
+
+        # JHY: NOTE: input blocks: downsample blocks
         for module in self.input_blocks:
+            # (latent of image, time embed, prompt, grounding tokens)
             h = module(h, emb, context, objs)
             hs.append(h)
 
+        # JHY: NOTE: bottle neck blocks
+        # (latent of image, time embed, prompt, grounding tokens)
         h = self.middle_block(h, emb, context, objs)
 
+        # JHY: NOTE: output blocks: upsample blocks
         for module in self.output_blocks:
+            # jump connection, concate the latent image at same resolution
             h = th.cat([h, hs.pop()], dim=1)
+            # (latent of image, time embed, prompt, grounding tokens)
             h = module(h, emb, context, objs)
 
         return self.out(h)

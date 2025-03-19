@@ -3,6 +3,8 @@ import torch as th
 
 # JHY: NOTE: take a raw batch from the dataloader to prepare the input for position_net and downsample_net
 
+# JHY: NOTE: version 2, to separately encode rotation information
+
 class GroundingNetInput:
     def __init__(self):
         self.set = False 
@@ -16,14 +18,18 @@ class GroundingNetInput:
 
         self.set = True
 
-        hed_edge=batch['hed_edge'] 
+        canny_edge=batch['canny_edge'] 
         mask=batch['mask']
 
-        self.batch, self.C, self.H, self.W = hed_edge.shape
-        self.device = hed_edge.device
-        self.dtype = hed_edge.dtype
+        # JHY: NOTE: add rotation
+        rotation = batch['rotation']
+        assert rotation.shape[0] == canny_edge.shape[0], "batch size of rotation is different from canny_edge"
 
-        return {"hed_edge":hed_edge, "mask":mask}
+        self.batch, self.C, self.H, self.W = canny_edge.shape
+        self.device = canny_edge.device
+        self.dtype = canny_edge.dtype
+
+        return {"canny_edge":canny_edge, "mask":mask, "rotation": rotation}
 
 
     def get_null_input(self, batch=None, device=None, dtype=None):
@@ -37,10 +43,13 @@ class GroundingNetInput:
         device = self.device if device is None else device
         dtype = self.dtype   if dtype  is None else dtype
 
-        hed_edge = th.zeros(self.batch, self.C, self.H, self.W).type(dtype).to(device) 
+        canny_edge = th.zeros(self.batch, self.C, self.H, self.W).type(dtype).to(device) 
         mask = th.zeros(batch).type(dtype).to(device) 
 
-        return {"hed_edge":hed_edge, "mask":mask}
+        # JHY: NOTE: add rotation
+        rotation = th.zeros(batch).type(dtype).to(device) 
+
+        return {"canny_edge":canny_edge, "mask":mask, "rotation": rotation}
 
 
 

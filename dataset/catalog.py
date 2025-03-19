@@ -3,6 +3,53 @@ import os
 class DatasetCatalog:
     def __init__(self, ROOT):
 
+        # JHY: NOTE: add toy dataset
+        self.ToyGroundingCanny = {
+            "target": "dataset.toy_dataset.ToyDataset",
+            "train_params":dict(
+                
+            ),
+        }
+
+        # ------------------ version 1
+
+        # JHY: NOTE: add ULIP plane dataset
+        self.ULIP2PlaneCanny = {
+            "target": "dataset.ULIP_ShapeNet.ULIP_ShapeNet",
+            "train_params":dict(
+                keyword="plane", 
+                grounding_type="canny",
+            ),
+        }
+
+        # JHY: NOTE: add ULIP chair dataset
+        self.ULIP2ChairCanny = {
+            "target": "dataset.ULIP_ShapeNet.ULIP_ShapeNet",
+            "train_params":dict(
+                keyword="chair", 
+                grounding_type="canny",
+            ),
+        }
+
+        # JHY: NOTE: add ULIP chair dataset
+        self.ULIP2ChairHED = {
+            "target": "dataset.ULIP_ShapeNet.ULIP_ShapeNet",
+            "train_params":dict(
+                keyword="chair", 
+                grounding_type="hed",
+            ),
+        }
+
+        # ------------------ version 2
+
+        # JHY: NOTE: version 2, integrate
+        self.ULIP2ShapeNet = {
+            "target": "dataset.ULIP_ShapeNet.ULIP_ShapeNet",
+            "train_params":dict(
+                
+            ),
+        }
+
 
         # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - # 
 

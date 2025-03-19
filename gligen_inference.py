@@ -340,7 +340,10 @@ def prepare_batch_sem(meta, batch=1):
 
 
 @torch.no_grad()
-def run(meta, config, starting_noise=None):
+def run(meta, args, starting_noise=None):
+    print("")
+    print("-"*10 + "Start this run" + "-"*10)
+    print("")
 
     # - - - - - prepare models - - - - - # 
     model, autoencoder, text_encoder, diffusion, config = load_ckpt(meta["ckpt"])
@@ -349,9 +352,20 @@ def run(meta, config, starting_noise=None):
     model.grounding_tokenizer_input = grounding_tokenizer_input
     
     grounding_downsampler_input = None
+    # JHY: NOTE
     if "grounding_downsampler_input" in config:
         grounding_downsampler_input = instantiate_from_config(config['grounding_downsampler_input'])
 
+    print("")
+    print("config:")
+    print(config)
+    print("")
+    # print("grounding_tokenizer_input:")
+    # print(grounding_tokenizer_input)
+    # print("")
+    # print("grounding_downsampler_input:")
+    # print(grounding_downsampler_input)
+    # print("")
 
 
     # - - - - - update config from args - - - - - # 
@@ -360,35 +374,53 @@ def run(meta, config, starting_noise=None):
 
 
     # - - - - - prepare batch - - - - - #
-    if "keypoint" in meta["ckpt"]:
+
+    # prepare the batches to load the images, but hasn't encode them
+    if "keypoint" in meta["type"]:
         batch = prepare_batch_kp(meta, config.batch_size)
-    elif "hed" in meta["ckpt"]:
+    elif "hed" in meta["type"]:
         batch = prepare_batch_hed(meta, config.batch_size)
-    elif "canny" in meta["ckpt"]:
+    elif "canny" in meta["type"]:
         batch = prepare_batch_canny(meta, config.batch_size)
-    elif "depth" in meta["ckpt"]:
+    elif "depth" in meta["type"]:
         batch = prepare_batch_depth(meta, config.batch_size)
-    elif "normal" in meta["ckpt"]:
+    elif "normal" in meta["type"]:
         batch = prepare_batch_normal(meta, config.batch_size)
-    elif "sem" in meta["ckpt"]:
+    elif "sem" in meta["type"]:
         batch = prepare_batch_sem(meta, config.batch_size)
     else:
         batch = prepare_batch(meta, config.batch_size)
-    context = text_encoder.encode(  [meta["prompt"]]*config.batch_size  )
-    uc = text_encoder.encode( config.batch_size*[""] )
-    if args.negative_prompt is not None:
-        uc = text_encoder.encode( config.batch_size*[args.negative_prompt] )
 
+
+    context = text_encoder.encode(  [meta["prompt"]]*config.batch_size  )
+    print("meta[\"prompt\"] " + meta["prompt"])
+
+    uc = text_encoder.encode( config.batch_size*[""] )
+    if meta["negative_prompt"] is not None:
+        uc = text_encoder.encode( config.batch_size*[meta["negative_prompt"]] )
+    print("meta[\"negative_prompt\"] " + meta["negative_prompt"])
+    # if args.negative_prompt is not None:
+    #     uc = text_encoder.encode( config.batch_size*[args.negative_prompt] )
+    # print("args.negative_prompt " + args.negative_prompt)
+    print("")
 
     # - - - - - sampler - - - - - # 
+
+    print("")
+
+    # just register the sampler with diffusion schedule and UNet model
     alpha_generator_func = partial(alpha_generator, type=meta.get("alpha_type"))
     if config.no_plms:
+        print("--Sampler: DDIM")
         sampler = DDIMSampler(diffusion, model, alpha_generator_func=alpha_generator_func, set_alpha_scale=set_alpha_scale)
         steps = 250 
     else:
+        # defualt sampler
+        print("--Sampler: PLMS")
         sampler = PLMSSampler(diffusion, model, alpha_generator_func=alpha_generator_func, set_alpha_scale=set_alpha_scale)
         steps = 50 
 
+    print("")
 
     # - - - - - inpainting related - - - - - #
     inpainting_mask = z0 = None  # used for replacing known region in diffusion process
@@ -408,11 +440,42 @@ def run(meta, config, starting_noise=None):
     
 
     # - - - - - input for gligen - - - - - #
+
+    # encode / tokenize the grounding signal
     grounding_input = grounding_tokenizer_input.prepare(batch)
     grounding_extra_input = None
     if grounding_downsampler_input != None:
         grounding_extra_input = grounding_downsampler_input.prepare(batch)
 
+
+    def print_tensor_info(data, prefix=""):
+        if isinstance(data, dict):
+            for key, value in data.items():
+                print_tensor_info(value, prefix + key + ".")
+        elif isinstance(data, list):
+            for i, item in enumerate(data):
+                print_tensor_info(item, prefix + f"[{i}].")
+        elif isinstance(data, torch.Tensor):
+            print(f"{prefix}shape: {data.shape}")
+        else:
+            print(f"{prefix}{data}")
+    # print("")
+    # print("grounding_input:")
+    # print_tensor_info(grounding_input)
+    # print("grounding_extra_input:")
+    # print_tensor_info(grounding_extra_input)
+    # print("")
+
+    '''
+    grounding_input:
+    hed_edge.shape: torch.Size([4, 3, 512, 512])
+    mask.shape: torch.Size([4, 1])
+    grounding_extra_input: first_conv -> same size as the latent
+    shape: torch.Size([4, 3, 512, 512])
+    '''
+
+
+    # pack everything into the dict
     input = dict(
                 x = starting_noise, 
                 timesteps = None, 
@@ -425,11 +488,18 @@ def run(meta, config, starting_noise=None):
 
 
     # - - - - - start sampling - - - - - #
+    print("")
+    print("!! Start Sampling !!")
+
     shape = (config.batch_size, model.in_channels, model.image_size, model.image_size)
 
     samples_fake = sampler.sample(S=steps, shape=shape, input=input,  uc=uc, guidance_scale=config.guidance_scale, mask=inpainting_mask, x0=z0)
+
+    print("!! End Sampling !!")
+
     samples_fake = autoencoder.decode(samples_fake)
 
+    print("!! End Decoding !!")
 
     # - - - - - save - - - - - #
     output_folder = os.path.join( args.folder,  meta["save_folder_name"])
@@ -455,7 +525,7 @@ if __name__ == "__main__":
     parser.add_argument("--folder", type=str,  default="generation_samples", help="root folder for output")
 
 
-    parser.add_argument("--batch_size", type=int, default=5, help="")
+    parser.add_argument("--batch_size", type=int, default=4, help="")
     parser.add_argument("--no_plms", action='store_true', help="use DDIM instead. WARNING: I did not test the code yet")
     parser.add_argument("--guidance_scale", type=float,  default=7.5, help="")
     parser.add_argument("--negative_prompt", type=str,  default='longbody, lowres, bad anatomy, bad hands, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality', help="")
@@ -468,9 +538,11 @@ if __name__ == "__main__":
 
         # - - - - - - - - GLIGEN on text grounding for generation - - - - - - - - # 
         dict(
-            ckpt = "../gligen_checkpoints/checkpoint_generation_text.pth",
-            prompt = "a teddy bear sitting next to a bird",
-            phrases = ['a teddy bear', 'a bird'],
+            ckpt = "./gligen_checkpoints/checkpoint_generation_text.bin",
+            type = "",
+            prompt = "a dog is next to a dinosaur",
+            negative_prompt = args.negative_prompt + "",
+            phrases = ['a dog', 'a dinosaur'],
             locations = [ [0.0,0.09,0.33,0.76], [0.55,0.11,1.0,0.8] ],
             alpha_type = [0.3, 0.0, 0.7],
             save_folder_name="generation_box_text"
@@ -478,161 +550,209 @@ if __name__ == "__main__":
 
 
         # - - - - - - - - GLIGEN on text grounding for inpainting - - - - - - - - # 
-        dict(
-            ckpt = "../gligen_checkpoints/checkpoint_inpainting_text.pth",
-            input_image = "inference_images/dalle2_museum.jpg",
-            prompt = "a corgi and a cake",
-            phrases =   ['corgi', 'cake'],
-            locations = [ [0.25, 0.28, 0.42, 0.52], [0.14, 0.58, 0.58, 0.92], ], # mask will be derived from box 
-            save_folder_name="inpainting_box_text"
-        ),
+        # dict(
+        #     ckpt = "../gligen_checkpoints/checkpoint_inpainting_text.pth",
+        #     type = "",
+        #     input_image = "inference_images/dalle2_museum.jpg",
+        #     prompt = "a corgi and a cake",
+        #     negative_prompt = args.negative_prompt + "",
+        #     phrases =   ['corgi', 'cake'],
+        #     locations = [ [0.25, 0.28, 0.42, 0.52], [0.14, 0.58, 0.58, 0.92], ], # mask will be derived from box 
+        #     save_folder_name="inpainting_box_text"
+        # ),
 
 
         # - - - - - - - - GLIGEN on image grounding for generation - - - - - - - - # 
-        dict(
-            ckpt = "../gligen_checkpoints/checkpoint_generation_text_image.pth",
-            prompt = "an alarm clock sitting on the beach",
-            images = ['inference_images/clock.png'],
-            phrases = ['alarm clock'],
-            locations = [ [0.0,0.09,0.53,0.76] ],
-            alpha_type = [1.0, 0.0, 0.0],
-            save_folder_name="generation_box_image"
-        ),
+        # dict(
+        #     ckpt = "../gligen_checkpoints/checkpoint_generation_text_image.pth",
+        #     type = "",
+        #     prompt = "an alarm clock sitting on the beach",
+        #     negative_prompt = args.negative_prompt + "",
+        #     images = ['inference_images/clock.png'],
+        #     phrases = ['alarm clock'],
+        #     locations = [ [0.0,0.09,0.53,0.76] ],
+        #     alpha_type = [1.0, 0.0, 0.0],
+        #     save_folder_name="generation_box_image"
+        # ),
 
 
 
         # - - - - - - - - GLIGEN on text and style grounding for generation - - - - - - - - # 
-        dict(
-            ckpt = "../gligen_checkpoints/checkpoint_generation_text_image.pth",
-            prompt = "a brick house in the woods, anime, oil painting",
-            phrases =   ['a brick house',            'placehoder'],
-            images =    ['inference_images/placeholder.png', 'inference_images/style_golden.jpg'],
-            locations = [ [0.4,0.2,1.0,0.8],         [0.0, 1.0, 0.0, 1.0] ],
-            alpha_type = [1, 0, 0],  
-            text_mask = [1,0],  # the second text feature will be masked 
-            image_mask =[0,1],  # the first image feature will be masked
-            save_folder_name="generation_box_text_style"
-        ), 
+        # dict(
+        #     ckpt = "../gligen_checkpoints/checkpoint_generation_text_image.pth",
+        #     type = "",
+        #     prompt = "a brick house in the woods, anime, oil painting",
+        #     negative_prompt = args.negative_prompt + "",
+        #     phrases =   ['a brick house',            'placehoder'],
+        #     images =    ['inference_images/placeholder.png', 'inference_images/style_golden.jpg'],
+        #     locations = [ [0.4,0.2,1.0,0.8],         [0.0, 1.0, 0.0, 1.0] ],
+        #     alpha_type = [1, 0, 0],  
+        #     text_mask = [1,0],  # the second text feature will be masked 
+        #     image_mask =[0,1],  # the first image feature will be masked
+        #     save_folder_name="generation_box_text_style"
+        # ), 
 
 
         # - - - - - - - - GLIGEN on image grounding for inpainting - - - - - - - - # 
-        dict(
-            ckpt = "../gligen_checkpoints/checkpoint_inpainting_text_image.pth",
-            input_image = "inference_images/beach.jpg",
-            prompt = "a bigben on the beach",
-            images = [ 'inference_images/bigben.jpg'],
-            locations = [ [0.18, 0.08, 0.62, 0.75] ], # mask will be derived from box 
-            save_folder_name="inpainting_box_image"
-        ),
+        # dict(
+        #     ckpt = "../gligen_checkpoints/checkpoint_inpainting_text_image.pth",
+        #     type = "",
+        #     input_image = "inference_images/beach.jpg",
+        #     prompt = "a bigben on the beach",
+        #     negative_prompt = args.negative_prompt + "",
+        #     images = [ 'inference_images/bigben.jpg'],
+        #     locations = [ [0.18, 0.08, 0.62, 0.75] ], # mask will be derived from box 
+        #     save_folder_name="inpainting_box_image"
+        # ),
 
 
 
         # - - - - - - - - GLIGEN on hed grounding for generation - - - - - - - - # 
-        dict(
-            ckpt ="../gligen_checkpoints/checkpoint_generation_hed.pth",
-            prompt = "a man is eating breakfast",  
-            hed_image = 'inference_images/hed_man_eat.png',
-            save_folder_name="hed",
-            alpha_type = [0.9, 0, 0.1], 
-        ),
+        # dict(
+        #     # ckpt ="../gligen_checkpoints/checkpoint_generation_hed.pth",
+        #     type = "hed",
+        #     ckpt ="./gligen_checkpoints/checkpoint_generation_hed.bin",
+        #     prompt = "a man is eating breakfast",  
+        #     negative_prompt = args.negative_prompt + "",
+        #     # negative_prompt = ", no RGB colorful image",
+        #     hed_image = 'inference_images/hed_man_eat.png',
+        #     save_folder_name="hed",
+        #     alpha_type = [0.9, 0, 0.1], 
+        # ),
 
 
 
 
         # - - - - - - - - GLIGEN on canny grounding for generation - - - - - - - - # 
-        dict(
-            ckpt ="../gligen_checkpoints/checkpoint_generation_canny.pth",
-            prompt = "A Humanoid Robot Designed for Companionship", 
-            canny_image = 'inference_images/canny_robot.png',
-            alpha_type = [0.9, 0, 0.1], 
-            save_folder_name="canny"
-        ),
+        # dict(
+        #     ckpt ="../gligen_checkpoints/checkpoint_generation_canny.pth",
+        #     type = "canny",
+        #     prompt = "A Humanoid Robot Designed for Companionship", 
+        #     negative_prompt = args.negative_prompt + "",
+        #     canny_image = 'inference_images/canny_robot.png',
+        #     alpha_type = [0.9, 0, 0.1], 
+        #     save_folder_name="canny"
+        # ),
 
 
 
 
         # - - - - - - - - GLIGEN on normal grounding for generation - - - - - - - - # 
-        dict(
-            ckpt ="../gligen_checkpoints/checkpoint_generation_normal.pth",
-            prompt = "a large tree with no leaves in front of a building", # 
-            normal = 'inference_images/normal_tree_building.jpg', # a normal map 
-            alpha_type = [0.7, 0, 0.3], 
-            save_folder_name="normal",
-        ),
+        # dict(
+        #     ckpt ="../gligen_checkpoints/checkpoint_generation_normal.pth",
+        #     type = "normal",
+        #     prompt = "a large tree with no leaves in front of a building",
+        #     negative_prompt = args.negative_prompt + "",
+        #     normal = 'inference_images/normal_tree_building.jpg', # a normal map 
+        #     alpha_type = [0.7, 0, 0.3], 
+        #     save_folder_name="normal",
+        # ),
 
 
         # - - - - - - - - GLIGEN on depth grounding for generation - - - - - - - - # 
-        dict(
-            ckpt ="../gligen_checkpoints/checkpoint_generation_depth.pth",
-            prompt = "a Vibrant colorful Bird Sitting on Tree Branch", # 
-            depth = 'inference_images/depth_bird.png', 
-            alpha_type = [0.7, 0, 0.3], 
-            save_folder_name="depth"
-        ),
+        # dict(
+        #     ckpt ="../gligen_checkpoints/checkpoint_generation_depth.pth",
+        #     type = "depth",
+        #     prompt = "a Vibrant colorful Bird Sitting on Tree Branch",
+        #     negative_prompt = args.negative_prompt + "",
+        #     depth = 'inference_images/depth_bird.png', 
+        #     alpha_type = [0.7, 0, 0.3], 
+        #     save_folder_name="depth"
+        # ),
 
 
         # - - - - - - - - GLIGEN on sem grounding for generation - - - - - - - - # 
-        dict(
-            ckpt ="../gligen_checkpoints/checkpoint_generation_sem.pth",
-            prompt = "a living room filled with lots of furniture and plants", # 
-            sem = 'inference_images/sem_ade_living_room.png', # ADE raw annotation  
-            alpha_type = [0.7, 0, 0.3], 
-            save_folder_name="sem"
-        ),
+        # dict(
+        #     ckpt ="../gligen_checkpoints/checkpoint_generation_sem.pth",
+        #     type = "sem",
+        #     prompt = "a living room filled with lots of furniture and plants",
+        #     negative_prompt = args.negative_prompt + "",
+        #     sem = 'inference_images/sem_ade_living_room.png', # ADE raw annotation  
+        #     alpha_type = [0.7, 0, 0.3], 
+        #     save_folder_name="sem"
+        # ),
 
 
 
         # - - - - - - - - GLIGEN on keypoint grounding for generation - - - - - - - - # 
-        dict(
-            ckpt = "../gligen_checkpoints/checkpoint_generation_keypoint.pth",
-            prompt = "A young man and a small boy are talking",
-            locations = [  
-                            [
-                                [0.7598, 0.2542],
-                                [0.7431, 0.2104],
-                                [0.8118, 0.2021],
-                                [0.0000, 0.0000],
-                                [0.9514, 0.1813],
-                                [0.7806, 0.2917],
-                                [0.0000, 0.0000],
-                                [0.6785, 0.5125],
-                                [0.0000, 0.0000],
-                                [0.5389, 0.6479],
-                                [0.6785, 0.6750],
-                                [0.7973, 0.7042],
-                                [0.0000, 0.0000],
-                                [0.6181, 0.7375],
-                                [0.9764, 0.8458],
-                                [0.0000, 0.0000],
-                                [0.0000, 0.0000]
-                            ], 
+        # dict(
+        #     ckpt = "../gligen_checkpoints/checkpoint_generation_keypoint.pth",
+        #     type = "keypoint",
+        #     prompt = "A young man and a small boy are talking",
+        #     negative_prompt = args.negative_prompt + "",
+        #     locations = [  
+        #                     [
+        #                         [0.7598, 0.2542],
+        #                         [0.7431, 0.2104],
+        #                         [0.8118, 0.2021],
+        #                         [0.0000, 0.0000],
+        #                         [0.9514, 0.1813],
+        #                         [0.7806, 0.2917],
+        #                         [0.0000, 0.0000],
+        #                         [0.6785, 0.5125],
+        #                         [0.0000, 0.0000],
+        #                         [0.5389, 0.6479],
+        #                         [0.6785, 0.6750],
+        #                         [0.7973, 0.7042],
+        #                         [0.0000, 0.0000],
+        #                         [0.6181, 0.7375],
+        #                         [0.9764, 0.8458],
+        #                         [0.0000, 0.0000],
+        #                         [0.0000, 0.0000]
+        #                     ], 
 
-                            [
-                                [0.2681, 0.4313],
-                                [0.2514, 0.3979],
-                                [0.0000, 0.0000],
-                                [0.0785, 0.3854],
-                                [0.0000, 0.0000],
-                                [0.0910, 0.5583],
-                                [0.0000, 0.0000],
-                                [0.1243, 0.8479],
-                                [0.0000, 0.0000],
-                                [0.0000, 0.0000],
-                                [0.0000, 0.0000],
-                                [0.0000, 0.0000],
-                                [0.0000, 0.0000],
-                                [0.2410, 0.8146],
-                                [0.1202, 0.6146],
-                                [0.0000, 0.0000],
-                                [0.2743, 0.7188]
-                            ], 
+        #                     [
+        #                         [0.2681, 0.4313],
+        #                         [0.2514, 0.3979],
+        #                         [0.0000, 0.0000],
+        #                         [0.0785, 0.3854],
+        #                         [0.0000, 0.0000],
+        #                         [0.0910, 0.5583],
+        #                         [0.0000, 0.0000],
+        #                         [0.1243, 0.8479],
+        #                         [0.0000, 0.0000],
+        #                         [0.0000, 0.0000],
+        #                         [0.0000, 0.0000],
+        #                         [0.0000, 0.0000],
+        #                         [0.0000, 0.0000],
+        #                         [0.2410, 0.8146],
+        #                         [0.1202, 0.6146],
+        #                         [0.0000, 0.0000],
+        #                         [0.2743, 0.7188]
+        #                     ], 
 
-             ],  # from id=18150 val set in coco2017k
-            alpha_type = [0.3, 0.0, 0.7],
-            save_folder_name="keypoint"
-        ),
+        #      ],  # from id=18150 val set in coco2017k
+        #     alpha_type = [0.3, 0.0, 0.7],
+        #     save_folder_name="keypoint"
+        # ),
 
 
+        # - - - - - - - - GLIGEN on toy dataset for generation - - - - - - - - #
+        # dict(
+        #     ckpt ="./OUTPUT/gligen_toy_data/tag01/checkpoint_latest.pth",
+        #     type = "canny",
+        #     # canny_image = 'inference_images/canny_robot.png',
+        #     # prompt = "A humanoid robot in red designed for companionship, in a yellow background",
+        #     canny_image = 'inference_images/toy_8.png',
+        #     prompt = "yellow circle on a green background",
+        #     negative_prompt = args.negative_prompt + "", 
+        #     alpha_type = [0.9, 0, 0.1], 
+        #     save_folder_name="toy_data"
+        # ),
+
+        # - - - - - - - - GLIGEN on toy dataset for generation - - - - - - - - #
+        # dict(
+        #     ckpt ="./OUTPUT/ulip_plane_canny_FIN/tag02/checkpoint_00260001.pth",
+        #     type = "canny",
+        #     canny_image = '/home/haiyang/1_Downloads/ULIP_selected_images/plane_6.png',
+        #     # canny_image = '/home/haiyang/1_Downloads/ULIP_selected_images/plane_9.jpg',
+        #     # canny_image = './generation_samples/ulip_plane_canny/2.png',
+        #     prompt = "Image of a 3D rendering airplane, with 48 degree rotating based on the reference image.",
+        #     # negative_prompt = args.negative_prompt + "", 
+        #     negative_prompt = "", 
+        #     alpha_type = [0.9, 0, 0.1], 
+        #     save_folder_name="ulip_plane_canny"
+        # ),
 
     ]
 
@@ -641,8 +761,3 @@ if __name__ == "__main__":
     starting_noise = None
     for meta in meta_list:
         run(meta, args, starting_noise)
-
-    
-
-
-

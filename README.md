@@ -1,5 +1,50 @@
-
 # GLIGEN: Open-Set Grounded Text-to-Image Generation (CVPR 2023)
+
+## Quick Inference Setup with Docker
+
+Follow these steps to quickly run GLIGEN inference using Docker:
+
+### 1. Prepare Model Weights
+```bash
+# Create directory for checkpoints
+mkdir -p gligen_checkpoints
+
+# Download the model from Hugging Face (if not already downloaded)
+# From: https://huggingface.co/gligen/gligen-generation-text-box/blob/main/diffusion_pytorch_model.bin
+# Rename the downloaded file to match the expected name in the code
+mv diffusion_pytorch_model.bin gligen_checkpoints/checkpoint_generation_text.bin
+```
+
+### 2. Build Docker Container
+```bash
+# Build the Docker image with all dependencies
+docker build -t gligen-inference -f env_docker/Dockerfile .
+```
+
+### 3. Run Inference
+```bash
+# Run the container with GPU support and mounted project directory
+docker run -it --rm --gpus all -v $(pwd):/workspace gligen-inference /bin/bash
+
+# Inside the container, run inference
+cd /workspace
+python gligen_inference.py --folder generation_samples --batch_size 4
+```
+
+The default configuration generates images with "a dog next to a dinosaur" using text-based grounding with bounding boxes.
+
+### 4. Troubleshooting
+
+If you encounter errors:
+- For CUDA memory issues: Reduce batch size (`--batch_size 1`)
+- For missing dependencies: Inside the container, run `pip install wandb` or other required packages
+- For CUDA/GPU access: Make sure your host has proper NVIDIA drivers installed
+
+### 5. Modifying Generation Parameters
+
+Edit the `meta_list` in `gligen_inference.py` to change generation parameters such as prompt, grounding type, and layout.
+
+---
 
 [Yuheng Li](https://yuheng-li.github.io/), [Haotian Liu](https://hliu.cc), [Qingyang Wu](https://scholar.google.ca/citations?user=HDiw-TsAAAAJ&hl=en/), [Fangzhou Mu](https://pages.cs.wisc.edu/~fmu/), [Jianwei Yang](https://jwyang.github.io/), [Jianfeng Gao](https://www.microsoft.com/en-us/research/people/jfgao/), [Chunyuan Li*](https://chunyuan.li/), [Yong Jae Lee*](https://pages.cs.wisc.edu/~yongjaelee/) (*Co-senior authors)
 
@@ -9,7 +54,7 @@
 [![IMAGE ALT TEXT HERE](https://github.com/gligen/GLIGEN/blob/master/figures/teaser_v4.png)](https://youtu.be/-MCkU7IAGKs)
 
 - Go beyond text prompt with GLIGEN: enable new capabilities on frozen text-to-image generation models to ground on various prompts, including box, keypoints and images.
-- GLIGEN’s zero-shot performance on COCO and LVIS outperforms that of existing supervised layout-to-image baselines by a large margin.
+- GLIGEN's zero-shot performance on COCO and LVIS outperforms that of existing supervised layout-to-image baselines by a large margin.
 
 
 ## :fire: News
